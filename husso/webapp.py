@@ -10,7 +10,9 @@ Güvenlik:
 - `/api/*` uç noktaları rastgele bir oturum jetonu (token) ister; jeton
   yalnızca sunucunun ürettiği sayfaya gömülür. Böylece kötü niyetli bir web
   sayfasının (drive-by) yerel API'yi çağırması engellenir.
-- `Host` başlığı loopback dışıysa istekler reddedilir (DNS rebinding koruması).
+- `Host` başlığı, bağlanılan adrese (veya loopback'e) uymuyorsa istekler
+  reddedilir (DNS rebinding koruması). `0.0.0.0`/`::` gibi joker adreslerde
+  tüm Host başlıkları kabul edilir ve koruma yalnızca oturum jetonuna dayanır.
 - İstemci tarafında cihaz verisi `innerHTML` yerine metin olarak kaçışlanır
   (XSS koruması).
 """
@@ -167,15 +169,24 @@ loadDevices();
 """
 
 
-def _host_is_loopback(host_header: str | None) -> bool:
-    """`Host` başlığının loopback bir adrese işaret edip etmediğini doğrular."""
+def _extract_hostname(host_header: str | None) -> str | None:
+    """`Host` başlığından (varsa) yalnızca ana bilgisayar adını çıkarır."""
 
     if not host_header:
-        return False
+        return None
     hostname = host_header.rsplit(":", 1)[0] if host_header.count(":") <= 1 else host_header
     # IPv6 köşeli parantezleri temizle
     if hostname.startswith("[") and "]" in hostname:
         hostname = hostname[1 : hostname.index("]")]
+    return hostname or None
+
+
+def _host_is_loopback(host_header: str | None) -> bool:
+    """`Host` başlığının loopback bir adrese işaret edip etmediğini doğrular."""
+
+    hostname = _extract_hostname(host_header)
+    if hostname is None:
+        return False
     if hostname in _ALLOWED_HOSTNAMES:
         return True
     try:
@@ -184,9 +195,41 @@ def _host_is_loopback(host_header: str | None) -> bool:
         return False
 
 
+_WILDCARD_HOSTS = {"", "0.0.0.0", "::", "[::]"}
+
+
+def _allowed_hosts_for(bind_host: str) -> frozenset[str] | None:
+    """Bağlanılan adrese göre kabul edilecek `Host` adlarını döndürür.
+
+    `None` dönerse (0.0.0.0 / :: gibi joker adresler) tüm `Host` başlıkları
+    kabul edilir; bu durumda koruma yalnızca oturum jetonuna dayanır.
+    """
+
+    if bind_host in _WILDCARD_HOSTS:
+        return None
+    allowed = set(_ALLOWED_HOSTNAMES)
+    allowed.add(bind_host)
+    return frozenset(allowed)
+
+
 class _Handler(BaseHTTPRequestHandler):
     adb: Adb  # sınıf düzeyinde enjekte edilir
     token: str  # sınıf düzeyinde enjekte edilir
+    allowed_hosts: frozenset[str] | None = frozenset(_ALLOWED_HOSTNAMES)  # None => tümü
+
+    def _host_allowed(self) -> bool:
+        # DNS rebinding koruması: yalnızca beklenen `Host` başlıklarını kabul et.
+        if self.allowed_hosts is None:
+            return True  # joker bağlanma (0.0.0.0 / ::): koruma jetona dayanır
+        hostname = _extract_hostname(self.headers.get("Host"))
+        if hostname is None:
+            return False
+        if hostname in self.allowed_hosts:
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -206,8 +249,7 @@ class _Handler(BaseHTTPRequestHandler):
         return secrets.compare_digest(provided, self.token)
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib arayüzü)
-        # DNS rebinding koruması: yalnızca loopback Host başlıklarını kabul et.
-        if not _host_is_loopback(self.headers.get("Host")):
+        if not self._host_allowed():
             self._send(403, b"Forbidden", "text/plain; charset=utf-8")
             return
 
@@ -269,7 +311,11 @@ def make_server(
     handler = type(
         "_BoundHandler",
         (_Handler,),
-        {"adb": resolved_adb, "token": resolved_token},
+        {
+            "adb": resolved_adb,
+            "token": resolved_token,
+            "allowed_hosts": _allowed_hosts_for(host),
+        },
     )
     return ThreadingHTTPServer((host, port), handler)
 
@@ -283,9 +329,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not _host_is_loopback(args.host):
+        detail = (
+            "joker adres: tüm Host başlıkları kabul edilir, koruma yalnızca jetona dayanır"
+            if _allowed_hosts_for(args.host) is None
+            else "yalnızca bu adrese gelen Host başlıkları kabul edilir"
+        )
         print(
-            f"UYARI: '{args.host}' loopback değil. Teşhis API'si ağa açılıyor; "
-            "yalnızca güvendiğiniz bir ağda kullanın (jeton koruması aktif olsa da)."
+            f"UYARI: '{args.host}' loopback değil. Teşhis API'si ağa açılıyor "
+            f"({detail}); yalnızca güvendiğiniz bir ağda kullanın."
         )
 
     server = make_server(args.host, args.port)

@@ -40,12 +40,18 @@ python -m husso info --json         # JSON çıktı (fiş/kayıt sistemine aktar
 
 ## Kullanım (yerel web arayüzü)
 ```bash
-python -m husso.webapp              # http://127.0.0.1:8765
+python -m husso.webapp                       # http://127.0.0.1:8765
+python -m husso.webapp --host 0.0.0.0        # ağa aç (dikkatli olun)
 ```
-Tarayıcıdan cihazı seçip "Teşhis Et"e basın. Sunucu yalnızca `localhost`
-üzerinde çalışır. `/api` uç noktaları her başlatmada üretilen rastgele bir
-oturum jetonu ile korunur (sayfayı bu sunucunun kendisinden açın); ayrıca
-loopback dışı `Host` başlıkları reddedilir (DNS rebinding koruması).
+Tarayıcıdan cihazı seçip "Teşhis Et"e basın. Sunucu varsayılan olarak yalnızca
+`localhost` üzerinde çalışır. `/api` uç noktaları her başlatmada üretilen
+rastgele bir oturum jetonu ile korunur (sayfayı bu sunucunun kendisinden açın).
+
+`Host` başlığı doğrulaması (DNS rebinding koruması):
+- Varsayılan (loopback) veya belirli bir adrese (`--host 192.168.1.5`) bağlanınca
+  yalnızca o adrese/loopback'e gelen `Host` başlıkları kabul edilir.
+- Joker adreslerde (`--host 0.0.0.0` / `::`) tüm `Host` başlıkları kabul edilir;
+  bu modda koruma yalnızca oturum jetonuna dayanır, yalnızca güvenilir ağda kullanın.
 
 ## Testler
 ```bash
