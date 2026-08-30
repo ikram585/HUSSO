@@ -66,8 +66,8 @@ class DeviceReport:
 _BATTERY_STATUS = {
     "1": "Bilinmiyor",
     "2": "Şarj oluyor",
-    "3": "Şarj olmuyor",
-    "4": "Boşalıyor",
+    "3": "Boşalıyor",
+    "4": "Şarj olmuyor",
     "5": "Dolu",
 }
 
@@ -150,6 +150,71 @@ def parse_df(df_output: str) -> StorageInfo:
     return info
 
 
+def interpret_secure_lock(
+    disabled_out: Optional[str], password_type_out: Optional[str]
+) -> tuple[Optional[bool], Optional[str]]:
+    """Güvenli ekran kilidi (PIN/desen/parola) var mı, en iyi çabayla belirler.
+
+    `locksettings get-disabled` yalnızca kilit ekranının tamamen kapalı olup
+    olmadığını söyler; kaydırma (swipe) ile güvenli kimlik arasındaki farkı
+    ayırt etmez. Bu yüzden `lockscreen.password_type` (DevicePolicyManager
+    parola kalitesi sabiti) birincil sinyal olarak kullanılır. Güvenilir bir
+    cevap üretilemezse `None` ve açıklayıcı bir not döndürülür.
+    """
+
+    disabled = (disabled_out or "").strip().lower()
+    ptype = (password_type_out or "").strip().lower()
+
+    # Birincil sinyal: parola kalitesi (>0 => PIN/desen/parola gibi güvenli kimlik)
+    if ptype and ptype != "null":
+        try:
+            return int(ptype, 0) > 0, None
+        except ValueError:
+            pass
+
+    if disabled == "true":
+        # Kilit ekranı tamamen kapalı => güvenli kimlik yok
+        return False, None
+    if disabled == "false":
+        return None, (
+            "Kilit ekranı etkin; güvenli kimlik türü (PIN/desen/parola) "
+            "ADB ile ayırt edilemedi."
+        )
+    return None, "Ekran kilidi durumu okunamadı (yetki/sürüm sınırı)."
+
+
+def interpret_google_accounts(dumpsys_account_out: str) -> tuple[Optional[bool], Optional[str]]:
+    """`dumpsys account` çıktısından yapılandırılmış Google hesabı olup olmadığını çıkarır.
+
+    Dikkat: çıktı, kayıtlı authenticator servislerini (ör. `com.google`) de
+    listeler; bunlar gerçek bir hesap anlamına gelmez. Bu yüzden yalnızca
+    `Account {...}` girdileri incelenir. `Accounts:` bloğu ayrıştırılamazsa
+    `None` döndürülür.
+    """
+
+    account_lines = [
+        line for line in dumpsys_account_out.splitlines() if "Account {" in line
+    ]
+    if account_lines:
+        for line in account_lines:
+            if "type=com.google" in line:
+                return True, None
+        return False, None
+
+    # "Accounts: N" göstergesini yedek sinyal olarak kullan
+    for line in dumpsys_account_out.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("accounts:"):
+            value = stripped.split(":", 1)[1].strip()
+            if value == "0":
+                return False, None
+            break
+    return None, (
+        "Hesap listesi ayrıştırılamadı; Google hesabı durumu belirsiz "
+        "(FRP durumu ADB ile güvenilir şekilde okunamaz)."
+    )
+
+
 class DiagnosticsCollector:
     """Bir cihaz için `DeviceReport` üretir."""
 
@@ -194,21 +259,20 @@ class DiagnosticsCollector:
             info.bootloader_locked = flash_locked == "1"
 
         # Güvenli ekran kilidi ayarlı mı? (yalnızca gösterge; doğrulama gerektirmez)
-        lock = self._adb.shell(serial, "locksettings get-disabled")
-        if lock.ok and lock.stdout.strip():
-            val = lock.stdout.strip().lower()
-            if val in {"true", "false"}:
-                # get-disabled true => kilit YOK
-                info.secure_lock_set = val == "false"
-            else:
-                info.notes.append("Ekran kilidi durumu okunamadı (yetki gerekebilir).")
-        else:
-            info.notes.append("Ekran kilidi durumu okunamadı (cihaz kilitliyken sınırlı).")
+        disabled = self._adb.shell(serial, "locksettings get-disabled")
+        ptype = self._adb.shell(serial, "settings get secure lockscreen.password_type")
+        info.secure_lock_set, lock_note = interpret_secure_lock(
+            disabled.stdout if disabled.ok else None,
+            ptype.stdout if ptype.ok else None,
+        )
+        if lock_note:
+            info.notes.append(lock_note)
 
         accounts = self._adb.shell(serial, "dumpsys account")
         if accounts.ok and accounts.stdout.strip():
-            has_google = "com.google" in accounts.stdout
-            info.google_accounts_present = has_google
+            info.google_accounts_present, acc_note = interpret_google_accounts(accounts.stdout)
+            if acc_note:
+                info.notes.append(acc_note)
         else:
             info.notes.append(
                 "Hesap bilgisi okunamadı; FRP durumu ADB ile güvenilir şekilde okunamaz."

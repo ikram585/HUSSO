@@ -45,7 +45,7 @@ class SubprocessRunner:
     """Gerçek `adb` çalıştırılabilir dosyasını `subprocess` ile çağırır."""
 
     def __init__(self, adb_path: str | None = None) -> None:
-        resolved = adb_path or shutil.which("adb")
+        resolved = shutil.which(adb_path) if adb_path else shutil.which("adb")
         if not resolved:
             raise AdbNotFoundError(
                 "`adb` bulunamadı. Android platform-tools kurun ve PATH'e ekleyin."

@@ -4,17 +4,29 @@
     python -m husso.webapp        # http://127.0.0.1:8765
 
 Teknisyen tarayıcıdan cihazları listeleyip teşhis raporunu görebilir.
-Sunucu yalnızca localhost'a bağlanır; dışarıya açılmaz.
+
+Güvenlik:
+- Sunucu varsayılan olarak yalnızca `127.0.0.1` üzerinde dinler.
+- `/api/*` uç noktaları rastgele bir oturum jetonu (token) ister; jeton
+  yalnızca sunucunun ürettiği sayfaya gömülür. Böylece kötü niyetli bir web
+  sayfasının (drive-by) yerel API'yi çağırması engellenir.
+- `Host` başlığı loopback dışıysa istekler reddedilir (DNS rebinding koruması).
+- İstemci tarafında cihaz verisi `innerHTML` yerine metin olarak kaçışlanır
+  (XSS koruması).
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .adb import Adb, AdbError, SubprocessRunner
 from .diagnostics import DiagnosticsCollector
+
+_ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
 _INDEX_HTML = """<!doctype html>
 <html lang="tr">
@@ -54,11 +66,22 @@ _INDEX_HTML = """<!doctype html>
   <div id="output"></div>
 </main>
 <script>
+const TOKEN = "__HUSSO_TOKEN__";
+function api(path) {
+  return fetch(path, { headers: { "X-HUSSO-Token": TOKEN } });
+}
+// Metni HTML olarak değil düz metin olarak işlemek için kaçış (XSS koruması).
+function esc(v) {
+  if (v === null || v === undefined || v === '') return '-';
+  return String(v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 async function loadDevices() {
   const st = document.getElementById('status');
   st.textContent = 'Cihazlar taranıyor...';
   try {
-    const r = await fetch('/api/devices');
+    const r = await api('/api/devices');
     const data = await r.json();
     const sel = document.getElementById('devices');
     sel.innerHTML = '';
@@ -69,18 +92,19 @@ async function loadDevices() {
     for (const d of data.devices) {
       const opt = document.createElement('option');
       opt.value = d.serial;
+      // textContent kullanıldığı için içerik otomatik kaçışlanır.
       opt.textContent = d.serial + ' (' + d.state + (d.model ? ', ' + d.model : '') + ')';
       sel.appendChild(opt);
     }
     st.textContent = data.devices.length + ' cihaz bulundu.';
   } catch (e) {
-    st.innerHTML = '<span class="err">Hata: ' + e + '</span>';
+    document.getElementById('status').textContent = 'Hata: ' + e;
   }
 }
 function tbl(title, rows) {
-  let h = '<div class="card"><h2>' + title + '</h2><table>';
+  let h = '<div class="card"><h2>' + esc(title) + '</h2><table>';
   for (const [k, v] of rows) {
-    h += '<tr><td>' + k + '</td><td>' + (v === null || v === undefined || v === '' ? '-' : v) + '</td></tr>';
+    h += '<tr><td>' + esc(k) + '</td><td>' + esc(v) + '</td></tr>';
   }
   return h + '</table></div>';
 }
@@ -92,9 +116,9 @@ async function scan() {
   st.textContent = 'Teşhis yapılıyor...';
   out.innerHTML = '';
   try {
-    const r = await fetch('/api/info?serial=' + encodeURIComponent(sel.value));
+    const r = await api('/api/info?serial=' + encodeURIComponent(sel.value));
     const d = await r.json();
-    if (d.error) { st.innerHTML = '<span class="err">Hata: ' + d.error + '</span>'; return; }
+    if (d.error) { st.textContent = 'Hata: ' + d.error; return; }
     st.textContent = 'Rapor hazır.';
     let html = tbl('Genel', [
       ['Seri No', d.serial], ['Durum', d.state], ['Üretici', d.manufacturer],
@@ -127,11 +151,11 @@ async function scan() {
     ]);
     if (sec.notes && sec.notes.length) {
       html += '<div class="card"><h2>Notlar</h2>' +
-        sec.notes.map(n => '<div class="note">• ' + n + '</div>').join('') + '</div>';
+        sec.notes.map(n => '<div class="note">• ' + esc(n) + '</div>').join('') + '</div>';
     }
     out.innerHTML = html;
   } catch (e) {
-    st.innerHTML = '<span class="err">Hata: ' + e + '</span>';
+    document.getElementById('status').textContent = 'Hata: ' + e;
   }
 }
 document.getElementById('refresh').addEventListener('click', loadDevices);
@@ -143,8 +167,26 @@ loadDevices();
 """
 
 
+def _host_is_loopback(host_header: str | None) -> bool:
+    """`Host` başlığının loopback bir adrese işaret edip etmediğini doğrular."""
+
+    if not host_header:
+        return False
+    hostname = host_header.rsplit(":", 1)[0] if host_header.count(":") <= 1 else host_header
+    # IPv6 köşeli parantezleri temizle
+    if hostname.startswith("[") and "]" in hostname:
+        hostname = hostname[1 : hostname.index("]")]
+    if hostname in _ALLOWED_HOSTNAMES:
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 class _Handler(BaseHTTPRequestHandler):
     adb: Adb  # sınıf düzeyinde enjekte edilir
+    token: str  # sınıf düzeyinde enjekte edilir
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -159,11 +201,27 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:  # pragma: no cover - gürültüyü azalt
         pass
 
+    def _authorized(self) -> bool:
+        provided = self.headers.get("X-HUSSO-Token", "")
+        return secrets.compare_digest(provided, self.token)
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib arayüzü)
+        # DNS rebinding koruması: yalnızca loopback Host başlıklarını kabul et.
+        if not _host_is_loopback(self.headers.get("Host")):
+            self._send(403, b"Forbidden", "text/plain; charset=utf-8")
+            return
+
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
-            self._send(200, _INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            page = _INDEX_HTML.replace("__HUSSO_TOKEN__", self.token)
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
             return
+
+        if parsed.path.startswith("/api/"):
+            if not self._authorized():
+                self._send_json({"error": "Yetkisiz istek (geçersiz jeton)."}, code=401)
+                return
+
         if parsed.path == "/api/devices":
             try:
                 devices = self.adb.list_devices()
@@ -177,18 +235,42 @@ class _Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             serial = (qs.get("serial") or [None])[0]
             try:
-                collector = DiagnosticsCollector(self.adb)
-                report = collector.collect(serial)
-                self._send_json(report.to_dict())
+                self._handle_info(serial)
             except AdbError as exc:
                 self._send_json({"error": str(exc)}, code=500)
             return
         self._send(404, b"Not Found", "text/plain; charset=utf-8")
 
+    def _handle_info(self, serial: str | None) -> None:
+        if not serial:
+            self._send_json({"error": "Seri numarası gerekli."}, code=400)
+            return
+        # Seri numarasını mevcut cihaz listesine göre çözerek bağlantı durumunu al.
+        match = next((d for d in self.adb.list_devices() if d.serial == serial), None)
+        if match is None:
+            self._send_json(
+                {"error": f"'{serial}' cihazı bulunamadı; tarama sırasında çıkarılmış olabilir."},
+                code=404,
+            )
+            return
+        collector = DiagnosticsCollector(self.adb)
+        report = collector.collect(match.serial, state=match.state)
+        self._send_json(report.to_dict())
 
-def make_server(host: str = "127.0.0.1", port: int = 8765, adb: Adb | None = None) -> ThreadingHTTPServer:
+
+def make_server(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    adb: Adb | None = None,
+    token: str | None = None,
+) -> ThreadingHTTPServer:
     resolved_adb = adb or Adb(SubprocessRunner())
-    handler = type("_BoundHandler", (_Handler,), {"adb": resolved_adb})
+    resolved_token = token or secrets.token_urlsafe(24)
+    handler = type(
+        "_BoundHandler",
+        (_Handler,),
+        {"adb": resolved_adb, "token": resolved_token},
+    )
     return ThreadingHTTPServer((host, port), handler)
 
 
@@ -196,13 +278,20 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="HUSSO yerel web arayüzü.")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="127.0.0.1", help="Dinlenecek adres (varsayılan: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
+
+    if not _host_is_loopback(args.host):
+        print(
+            f"UYARI: '{args.host}' loopback değil. Teşhis API'si ağa açılıyor; "
+            "yalnızca güvendiğiniz bir ağda kullanın (jeton koruması aktif olsa da)."
+        )
 
     server = make_server(args.host, args.port)
     url = f"http://{args.host}:{args.port}"
     print(f"HUSSO web arayüzü çalışıyor: {url}  (durdurmak için Ctrl+C)")
+    print("Not: /api uç noktaları oturum jetonu ile korunur; sayfayı bu sunucudan açın.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:  # pragma: no cover

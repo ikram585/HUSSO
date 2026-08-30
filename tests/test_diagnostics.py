@@ -9,6 +9,8 @@ import pytest
 from husso.adb import Adb, AdbResult, parse_devices, parse_getprop
 from husso.diagnostics import (
     DiagnosticsCollector,
+    interpret_google_accounts,
+    interpret_secure_lock,
     parse_battery,
     parse_df,
 )
@@ -106,6 +108,7 @@ def _full_responses() -> dict[str, tuple[int, str]]:
         "shell dumpsys battery": (0, battery),
         "shell df -h /data": (0, df),
         "shell locksettings get-disabled": (0, "false\n"),
+        "shell settings get secure lockscreen.password_type": (0, "131072\n"),
         "shell dumpsys account": (0, "Accounts: 1\n  Account {name=x, type=com.google}\n"),
         "shell service call iphonesubinfo 1": (1, ""),
     }
@@ -158,6 +161,73 @@ def test_imei_parsed_from_service_call():
     report = DiagnosticsCollector(adb).collect("SM123")
     assert report.imei == "353865769810234"
     assert report.imei_note is None
+
+
+def test_battery_status_discharging_vs_not_charging():
+    # Android BatteryManager: 3 = DISCHARGING, 4 = NOT_CHARGING
+    assert parse_battery("  status: 3\n").status == "Boşalıyor"
+    assert parse_battery("  status: 4\n").status == "Şarj olmuyor"
+
+
+def test_interpret_secure_lock_disabled():
+    # Kilit ekranı tamamen kapalı => güvenli kimlik yok
+    assert interpret_secure_lock("true", None) == (False, None)
+
+
+def test_interpret_secure_lock_swipe_only():
+    # Kilit etkin ama parola tipi 0 (swipe) => güvenli değil
+    assert interpret_secure_lock("false", "0") == (False, None)
+
+
+def test_interpret_secure_lock_credentialed():
+    # Parola tipi > 0 (ör. PIN=131072) => güvenli kimlik var
+    assert interpret_secure_lock("false", "131072") == (True, None)
+
+
+def test_interpret_secure_lock_unknown_without_password_type():
+    # Kilit etkin ama tür okunamıyor => belirsiz + not
+    value, note = interpret_secure_lock("false", None)
+    assert value is None
+    assert note
+
+
+def test_interpret_secure_lock_unreadable():
+    value, note = interpret_secure_lock(None, None)
+    assert value is None
+    assert note
+
+
+def test_interpret_google_accounts_authenticator_only():
+    # GMS cihazı: com.google authenticator servisi var AMA hesap yok
+    dump = (
+        "Accounts: 0\n"
+        "RegisteredServicesCache: \n"
+        "  ServiceInfo: AuthenticatorDescription {type=com.google}\n"
+    )
+    assert interpret_google_accounts(dump) == (False, None)
+
+
+def test_interpret_google_accounts_present():
+    dump = "Accounts: 1\n  Account {name=x@gmail.com, type=com.google}\n"
+    assert interpret_google_accounts(dump) == (True, None)
+
+
+def test_interpret_google_accounts_non_google_only():
+    dump = "Accounts: 1\n  Account {name=x, type=com.whatsapp}\n"
+    assert interpret_google_accounts(dump) == (False, None)
+
+
+def test_interpret_google_accounts_unparseable():
+    value, note = interpret_google_accounts("garbage output with no accounts block")
+    assert value is None
+    assert note
+
+
+def test_collector_swipe_only_not_secure():
+    resp = _full_responses()
+    resp["shell settings get secure lockscreen.password_type"] = (0, "0\n")
+    report = DiagnosticsCollector(Adb(FakeRunner(resp))).collect("SM123")
+    assert report.security.secure_lock_set is False
 
 
 if __name__ == "__main__":  # pragma: no cover

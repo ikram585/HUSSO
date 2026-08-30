@@ -43,7 +43,9 @@ python -m husso info --json         # JSON çıktı (fiş/kayıt sistemine aktar
 python -m husso.webapp              # http://127.0.0.1:8765
 ```
 Tarayıcıdan cihazı seçip "Teşhis Et"e basın. Sunucu yalnızca `localhost`
-üzerinde çalışır, dışarıya açılmaz.
+üzerinde çalışır. `/api` uç noktaları her başlatmada üretilen rastgele bir
+oturum jetonu ile korunur (sayfayı bu sunucunun kendisinden açın); ayrıca
+loopback dışı `Host` başlıkları reddedilir (DNS rebinding koruması).
 
 ## Testler
 ```bash
@@ -56,3 +58,8 @@ Testler sahte bir `adb` çalıştırıcısı kullanır; gerçek cihaz gerektirme
 - IMEI birçok modern Android sürümünde ADB ile okunamaz; bu durumda araç
   bunu belirtir ve cihazda `*#06#` çevrilmesini önerir.
 - Ekran kilitliyken bazı bilgiler (hesap, kilit durumu) sınırlı okunur.
+- Ekran kilidi göstergesi kaydırma (swipe) ile güvenli kimlik (PIN/desen/
+  parola) arasındaki farkı yalnızca `lockscreen.password_type` okunabildiğinde
+  ayırt eder; okunamazsa değer boş bırakılıp not düşülür.
+- Google hesabı göstergesi yalnızca gerçek `Account {...}` girdilerini sayar;
+  kayıtlı authenticator servisleri hesap olarak sayılmaz.
