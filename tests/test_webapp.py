@@ -10,7 +10,7 @@ from typing import Sequence
 import pytest
 
 from husso.adb import Adb, AdbResult
-from husso.webapp import _allowed_hosts_for, _host_is_loopback, make_server
+from husso.webapp import HostBindingError, _host_is_loopback, main, make_server
 
 
 class FakeRunner:
@@ -55,34 +55,6 @@ def server():
     srv.server_close()
 
 
-@pytest.fixture()
-def remote_server():
-    """127.0.0.1'de dinler ama uzak bir ana bilgisayar adına bağlanmış gibi
-    yapılandırılmıştır; böylece Host doğrulaması loopback'siz test edilebilir."""
-
-    srv = make_server(host="127.0.0.1", port=0, adb=Adb(_make_runner()), token="testtoken")
-    srv.RequestHandlerClass.allowed_hosts = _allowed_hosts_for("host.example.lan")
-    port = srv.server_address[1]
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
-    yield port
-    srv.shutdown()
-    srv.server_close()
-
-
-@pytest.fixture()
-def wildcard_server():
-    """Joker (0.0.0.0) bağlanma: tüm Host başlıkları kabul edilir."""
-
-    srv = make_server(host="0.0.0.0", port=0, adb=Adb(_make_runner()), token="testtoken")
-    port = srv.server_address[1]
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
-    yield port
-    srv.shutdown()
-    srv.server_close()
-
-
 def _get(port: int, path: str, *, token: str | None = None, host: str | None = None):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
     if token is not None:
@@ -118,34 +90,16 @@ def test_api_rejects_non_loopback_host(server):
     assert exc.value.code == 403
 
 
-def test_remote_accepts_configured_host(remote_server):
-    resp = _get(remote_server, "/api/devices", token="testtoken", host="host.example.lan")
-    assert resp.status == 200
-    assert b"SER1" in resp.read()
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.5", "example.com"])
+def test_make_server_rejects_non_loopback_bind(host):
+    with pytest.raises(HostBindingError):
+        make_server(host=host, port=0, adb=Adb(_make_runner()), token="testtoken")
 
 
-def test_remote_rejects_other_host(remote_server):
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        _get(remote_server, "/api/devices", token="testtoken", host="evil.example.com")
-    assert exc.value.code == 403
-
-
-def test_wildcard_accepts_any_host(wildcard_server):
-    resp = _get(wildcard_server, "/api/devices", token="testtoken", host="anything.example")
-    assert resp.status == 200
-    assert b"SER1" in resp.read()
-
-
-def test_allowed_hosts_for_specific():
-    allowed = _allowed_hosts_for("192.168.1.5")
-    assert allowed is not None
-    assert "192.168.1.5" in allowed
-    assert "127.0.0.1" in allowed
-
-
-@pytest.mark.parametrize("wildcard", ["", "0.0.0.0", "::", "[::]"])
-def test_allowed_hosts_for_wildcard(wildcard):
-    assert _allowed_hosts_for(wildcard) is None
+def test_main_rejects_non_loopback_host(capsys):
+    code = main(["--host", "0.0.0.0"])
+    assert code == 2
+    assert "loopback değil" in capsys.readouterr().out
 
 
 def test_api_info_missing_serial(server):

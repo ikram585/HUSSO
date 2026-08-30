@@ -6,7 +6,7 @@ from typing import Sequence
 
 import pytest
 
-from husso.adb import Adb, AdbResult, parse_devices, parse_getprop
+from husso.adb import Adb, AdbError, AdbResult, parse_devices, parse_getprop
 from husso.diagnostics import (
     DiagnosticsCollector,
     interpret_google_accounts,
@@ -228,6 +228,36 @@ def test_collector_swipe_only_not_secure():
     resp["shell settings get secure lockscreen.password_type"] = (0, "0\n")
     report = DiagnosticsCollector(Adb(FakeRunner(resp))).collect("SM123")
     assert report.security.secure_lock_set is False
+
+
+class TimeoutRunner:
+    """getprop dışındaki her isteğe bağlı sorguda AdbError (zaman aşımı) fırlatır."""
+
+    def __init__(self, getprop_out: str):
+        self.getprop_out = getprop_out
+
+    def __call__(self, args: Sequence[str], timeout: float) -> AdbResult:
+        args = list(args)
+        lookup = args[2:] if len(args) >= 2 and args[0] == "-s" else args
+        if lookup[:2] == ["shell", "getprop"]:
+            return AdbResult(args=args, returncode=0, stdout=self.getprop_out, stderr="")
+        raise AdbError("zaman aşımı")
+
+
+def test_collector_survives_per_query_timeout():
+    # getprop başarılı; tüm isteğe bağlı sorgular zaman aşımına uğruyor.
+    getprop = "[ro.product.model]: [SM-G991B]\n[ro.product.manufacturer]: [samsung]\n"
+    report = DiagnosticsCollector(Adb(TimeoutRunner(getprop))).collect("SM123", state="device")
+    # Zaman aşımına rağmen getprop'tan gelen alanlar korunur.
+    assert report.model == "SM-G991B"
+    assert report.manufacturer == "samsung"
+    # İsteğe bağlı alanlar boş kalır, çökme olmaz.
+    assert report.battery.level_percent is None
+    assert report.storage.total_gb is None
+    assert report.security.secure_lock_set is None
+    assert report.imei is None
+    # Başarısız sorgular için açıklayıcı notlar eklenir.
+    assert any("tamamlanamadı" in n for n in report.security.notes)
 
 
 if __name__ == "__main__":  # pragma: no cover

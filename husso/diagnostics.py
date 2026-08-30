@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from .adb import Adb
+from .adb import Adb, AdbError, AdbResult
 
 
 @dataclass
@@ -233,23 +233,41 @@ class DiagnosticsCollector:
         report.security_patch = props.get("ro.build.version.security_patch")
         report.build_id = props.get("ro.build.display.id") or props.get("ro.build.id")
 
-        report.battery = self._collect_battery(serial)
-        report.storage = self._collect_storage(serial)
+        # Her isteğe bağlı sorgu kendi içinde izole edilir: birinde zaman aşımı
+        # (AdbError) olması diğer toplanmış alanları düşürmez.
+        battery, battery_note = self._collect_battery(serial)
+        report.battery = battery
+        report.storage, storage_note = self._collect_storage(serial)
         report.security = self._collect_security(serial, props)
         report.imei, report.imei_note = self._collect_imei(serial)
+        for note in (battery_note, storage_note):
+            if note:
+                report.security.notes.append(note)
         return report
 
-    def _collect_battery(self, serial: str | None) -> BatteryInfo:
-        result = self._adb.shell(serial, "dumpsys battery")
-        if not result.ok:
-            return BatteryInfo()
-        return parse_battery(result.stdout)
+    def _try_shell(self, serial: str | None, command: str) -> tuple[Optional[AdbResult], Optional[str]]:
+        """`adb shell` çalıştırır; zaman aşımı/ADB hatasını sessizce yakalar.
 
-    def _collect_storage(self, serial: str | None) -> StorageInfo:
-        result = self._adb.shell(serial, "df -h /data")
-        if not result.ok or not result.stdout.strip():
-            return StorageInfo()
-        return parse_df(result.stdout)
+        Böylece tek bir takılan sorgu tüm raporu iptal etmez. Hata durumunda
+        `(None, açıklayıcı not)` döner.
+        """
+
+        try:
+            return self._adb.shell(serial, command), None
+        except AdbError as exc:
+            return None, f"'{command}' sorgusu tamamlanamadı ({exc})."
+
+    def _collect_battery(self, serial: str | None) -> tuple[BatteryInfo, Optional[str]]:
+        result, note = self._try_shell(serial, "dumpsys battery")
+        if result is None or not result.ok:
+            return BatteryInfo(), note
+        return parse_battery(result.stdout), None
+
+    def _collect_storage(self, serial: str | None) -> tuple[StorageInfo, Optional[str]]:
+        result, note = self._try_shell(serial, "df -h /data")
+        if result is None or not result.ok or not result.stdout.strip():
+            return StorageInfo(), note
+        return parse_df(result.stdout), None
 
     def _collect_security(self, serial: str | None, props: dict[str, str]) -> SecurityInfo:
         info = SecurityInfo()
@@ -259,23 +277,25 @@ class DiagnosticsCollector:
             info.bootloader_locked = flash_locked == "1"
 
         # Güvenli ekran kilidi ayarlı mı? (yalnızca gösterge; doğrulama gerektirmez)
-        disabled = self._adb.shell(serial, "locksettings get-disabled")
-        ptype = self._adb.shell(serial, "settings get secure lockscreen.password_type")
+        disabled, disabled_note = self._try_shell(serial, "locksettings get-disabled")
+        ptype, ptype_note = self._try_shell(serial, "settings get secure lockscreen.password_type")
         info.secure_lock_set, lock_note = interpret_secure_lock(
-            disabled.stdout if disabled.ok else None,
-            ptype.stdout if ptype.ok else None,
+            disabled.stdout if disabled and disabled.ok else None,
+            ptype.stdout if ptype and ptype.ok else None,
         )
-        if lock_note:
-            info.notes.append(lock_note)
+        for note in (lock_note, disabled_note, ptype_note):
+            if note:
+                info.notes.append(note)
 
-        accounts = self._adb.shell(serial, "dumpsys account")
-        if accounts.ok and accounts.stdout.strip():
+        accounts, acc_query_note = self._try_shell(serial, "dumpsys account")
+        if accounts is not None and accounts.ok and accounts.stdout.strip():
             info.google_accounts_present, acc_note = interpret_google_accounts(accounts.stdout)
             if acc_note:
                 info.notes.append(acc_note)
         else:
             info.notes.append(
-                "Hesap bilgisi okunamadı; FRP durumu ADB ile güvenilir şekilde okunamaz."
+                acc_query_note
+                or "Hesap bilgisi okunamadı; FRP durumu ADB ile güvenilir şekilde okunamaz."
             )
         return info
 
@@ -286,8 +306,8 @@ class DiagnosticsCollector:
         okunabilir; okunamazsa `*#06#` ile ekrandan alınması önerilir.
         """
 
-        result = self._adb.shell(serial, "service call iphonesubinfo 1")
-        if result.ok and result.stdout.strip():
+        result, _ = self._try_shell(serial, "service call iphonesubinfo 1")
+        if result is not None and result.ok and result.stdout.strip():
             imei = _parse_service_call_string(result.stdout)
             if imei and imei.isdigit() and len(imei) >= 14:
                 return imei, None

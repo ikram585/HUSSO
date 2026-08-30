@@ -10,9 +10,10 @@ Güvenlik:
 - `/api/*` uç noktaları rastgele bir oturum jetonu (token) ister; jeton
   yalnızca sunucunun ürettiği sayfaya gömülür. Böylece kötü niyetli bir web
   sayfasının (drive-by) yerel API'yi çağırması engellenir.
-- `Host` başlığı, bağlanılan adrese (veya loopback'e) uymuyorsa istekler
-  reddedilir (DNS rebinding koruması). `0.0.0.0`/`::` gibi joker adreslerde
-  tüm Host başlıkları kabul edilir ve koruma yalnızca oturum jetonuna dayanır.
+- Sunucu yalnızca loopback (`127.0.0.1`/`::1`) üzerinde çalışır; ağa açık bir
+  bağlanma (`--host` ile loopback dışı bir adres) reddedilir. Bu sayede jeton ve
+  cihaz verisi ağdaki üçüncü kişilere şifresiz (HTTP) sızmaz.
+- `Host` başlığı loopback dışıysa istekler reddedilir (DNS rebinding koruması).
 - İstemci tarafında cihaz verisi `innerHTML` yerine metin olarak kaçışlanır
   (XSS koruması).
 """
@@ -195,41 +196,31 @@ def _host_is_loopback(host_header: str | None) -> bool:
         return False
 
 
-_WILDCARD_HOSTS = {"", "0.0.0.0", "::", "[::]"}
+class HostBindingError(ValueError):
+    """Loopback dışı bir adrese bağlanma isteği için yükseltilir."""
 
 
-def _allowed_hosts_for(bind_host: str) -> frozenset[str] | None:
-    """Bağlanılan adrese göre kabul edilecek `Host` adlarını döndürür.
+def _require_loopback_host(host: str) -> None:
+    """Loopback olmayan bir bağlanma adresini reddeder.
 
-    `None` dönerse (0.0.0.0 / :: gibi joker adresler) tüm `Host` başlıkları
-    kabul edilir; bu durumda koruma yalnızca oturum jetonuna dayanır.
+    Web arayüzü yalnızca yerel (loopback) kullanım içindir; ağa açılırsa oturum
+    jetonu ve cihaz verisi şifresiz HTTP üzerinden üçüncü kişilere sızabilir.
     """
 
-    if bind_host in _WILDCARD_HOSTS:
-        return None
-    allowed = set(_ALLOWED_HOSTNAMES)
-    allowed.add(bind_host)
-    return frozenset(allowed)
+    if not _host_is_loopback(host):
+        raise HostBindingError(
+            f"'{host}' loopback değil. HUSSO web arayüzü yalnızca yerel "
+            "(127.0.0.1/::1) kullanım içindir; ağa açık bağlanma desteklenmez."
+        )
 
 
 class _Handler(BaseHTTPRequestHandler):
     adb: Adb  # sınıf düzeyinde enjekte edilir
     token: str  # sınıf düzeyinde enjekte edilir
-    allowed_hosts: frozenset[str] | None = frozenset(_ALLOWED_HOSTNAMES)  # None => tümü
 
     def _host_allowed(self) -> bool:
-        # DNS rebinding koruması: yalnızca beklenen `Host` başlıklarını kabul et.
-        if self.allowed_hosts is None:
-            return True  # joker bağlanma (0.0.0.0 / ::): koruma jetona dayanır
-        hostname = _extract_hostname(self.headers.get("Host"))
-        if hostname is None:
-            return False
-        if hostname in self.allowed_hosts:
-            return True
-        try:
-            return ipaddress.ip_address(hostname).is_loopback
-        except ValueError:
-            return False
+        # DNS rebinding koruması: yalnızca loopback `Host` başlıklarını kabul et.
+        return _host_is_loopback(self.headers.get("Host"))
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -306,16 +297,13 @@ def make_server(
     adb: Adb | None = None,
     token: str | None = None,
 ) -> ThreadingHTTPServer:
+    _require_loopback_host(host)
     resolved_adb = adb or Adb(SubprocessRunner())
     resolved_token = token or secrets.token_urlsafe(24)
     handler = type(
         "_BoundHandler",
         (_Handler,),
-        {
-            "adb": resolved_adb,
-            "token": resolved_token,
-            "allowed_hosts": _allowed_hosts_for(host),
-        },
+        {"adb": resolved_adb, "token": resolved_token},
     )
     return ThreadingHTTPServer((host, port), handler)
 
@@ -324,22 +312,19 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="HUSSO yerel web arayüzü.")
-    parser.add_argument("--host", default="127.0.0.1", help="Dinlenecek adres (varsayılan: 127.0.0.1).")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Dinlenecek loopback adresi (varsayılan: 127.0.0.1). Ağa açık adres kabul edilmez.",
+    )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
 
-    if not _host_is_loopback(args.host):
-        detail = (
-            "joker adres: tüm Host başlıkları kabul edilir, koruma yalnızca jetona dayanır"
-            if _allowed_hosts_for(args.host) is None
-            else "yalnızca bu adrese gelen Host başlıkları kabul edilir"
-        )
-        print(
-            f"UYARI: '{args.host}' loopback değil. Teşhis API'si ağa açılıyor "
-            f"({detail}); yalnızca güvendiğiniz bir ağda kullanın."
-        )
-
-    server = make_server(args.host, args.port)
+    try:
+        server = make_server(args.host, args.port)
+    except HostBindingError as exc:
+        print(f"Hata: {exc}")
+        return 2
     url = f"http://{args.host}:{args.port}"
     print(f"HUSSO web arayüzü çalışıyor: {url}  (durdurmak için Ctrl+C)")
     print("Not: /api uç noktaları oturum jetonu ile korunur; sayfayı bu sunucudan açın.")
