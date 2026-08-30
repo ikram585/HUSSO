@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "husso"
+version = "0.1.0"
+description = "Teknik servis için ADB tabanlı Android cihaz teşhis aracı (yalnızca okuma)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+husso = "husso.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["husso*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
