@@ -102,6 +102,29 @@ def test_main_rejects_non_loopback_host(capsys):
     assert "loopback değil" in capsys.readouterr().out
 
 
+def test_main_handles_missing_adb(capsys, monkeypatch):
+    from husso import webapp
+    from husso.adb import AdbNotFoundError
+
+    def _boom(*args, **kwargs):
+        raise AdbNotFoundError("adb bulunamadı")
+
+    monkeypatch.setattr(webapp, "SubprocessRunner", _boom)
+    code = main(["--host", "127.0.0.1", "--port", "0"])
+    assert code == 2
+    assert "adb bulunamadı" in capsys.readouterr().out
+
+
+def test_make_server_ipv6_loopback():
+    import socket
+
+    srv = make_server(host="::1", port=0, adb=Adb(_make_runner()), token="testtoken")
+    try:
+        assert srv.socket.family == socket.AF_INET6
+    finally:
+        srv.server_close()
+
+
 def test_api_info_missing_serial(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(server, "/api/info", token="testtoken")

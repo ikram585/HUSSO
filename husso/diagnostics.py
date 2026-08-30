@@ -61,6 +61,14 @@ class DeviceReport:
         return asdict(self)
 
 
+def _failed_note(command: str, result: AdbResult) -> str:
+    """Sıfırdan farklı çıkışlı bir `adb shell` sonucundan açıklayıcı not üretir."""
+
+    detail = result.stderr.strip() or result.stdout.strip()
+    detail = f": {detail}" if detail else ""
+    return f"'{command}' sorgusu başarısız (çıkış {result.returncode}){detail}."
+
+
 # --- Ayrıştırıcılar (saf fonksiyonlar, kolay test edilir) ---
 
 _BATTERY_STATUS = {
@@ -249,7 +257,8 @@ class DiagnosticsCollector:
         """`adb shell` çalıştırır; zaman aşımı/ADB hatasını sessizce yakalar.
 
         Böylece tek bir takılan sorgu tüm raporu iptal etmez. Hata durumunda
-        `(None, açıklayıcı not)` döner.
+        `(None, açıklayıcı not)` döner. Sıfırdan farklı çıkış kodları da
+        `_failed_note` ile ayrı bir not olarak çağırana bildirilir.
         """
 
         try:
@@ -259,14 +268,20 @@ class DiagnosticsCollector:
 
     def _collect_battery(self, serial: str | None) -> tuple[BatteryInfo, Optional[str]]:
         result, note = self._try_shell(serial, "dumpsys battery")
-        if result is None or not result.ok:
+        if result is None:
             return BatteryInfo(), note
+        if not result.ok:
+            return BatteryInfo(), _failed_note("dumpsys battery", result)
         return parse_battery(result.stdout), None
 
     def _collect_storage(self, serial: str | None) -> tuple[StorageInfo, Optional[str]]:
         result, note = self._try_shell(serial, "df -h /data")
-        if result is None or not result.ok or not result.stdout.strip():
+        if result is None:
             return StorageInfo(), note
+        if not result.ok:
+            return StorageInfo(), _failed_note("df -h /data", result)
+        if not result.stdout.strip():
+            return StorageInfo(), None
         return parse_df(result.stdout), None
 
     def _collect_security(self, serial: str | None, props: dict[str, str]) -> SecurityInfo:

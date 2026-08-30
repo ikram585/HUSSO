@@ -260,5 +260,26 @@ def test_collector_survives_per_query_timeout():
     assert any("tamamlanamadı" in n for n in report.security.notes)
 
 
+def test_collector_notes_nonzero_command_exits():
+    # getprop başarılı; battery/storage sıfırdan farklı çıkışla başarısız oluyor.
+    runner = FakeRunner(
+        {
+            "shell getprop": (0, "[ro.product.model]: [Pixel]\n"),
+            "shell dumpsys battery": (1, ""),
+            "shell df -h /data": (2, ""),
+            "shell locksettings get-disabled": (0, "true\n"),
+            "shell settings get secure lockscreen.password_type": (0, "0\n"),
+            "shell dumpsys account": (0, "Accounts: 0\n"),
+            "shell service call iphonesubinfo 1": (1, ""),
+        }
+    )
+    report = DiagnosticsCollector(Adb(runner)).collect("SER1", state="device")
+    # getprop alanları korunur.
+    assert report.model == "Pixel"
+    # Başarısız (nonzero) sorgular için "başarısız" notu düşülür.
+    assert any("dumpsys battery" in n and "başarısız" in n for n in report.security.notes)
+    assert any("df -h /data" in n and "başarısız" in n for n in report.security.notes)
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

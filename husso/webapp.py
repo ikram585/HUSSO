@@ -23,6 +23,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import secrets
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -305,7 +306,31 @@ def make_server(
         (_Handler,),
         {"adb": resolved_adb, "token": resolved_token},
     )
-    return ThreadingHTTPServer((host, port), handler)
+    server_cls = _server_class_for(host)
+    bind_host = _extract_hostname(host) or host
+    return server_cls((bind_host, port), handler)
+
+
+class _ThreadingHTTPServerV6(ThreadingHTTPServer):
+    """IPv6 loopback (`::1`) bağlanması için AF_INET6 kullanan sunucu."""
+
+    address_family = socket.AF_INET6
+
+
+def _server_class_for(host: str) -> type[ThreadingHTTPServer]:
+    """Bağlanma adresinin ailesine göre uygun sunucu sınıfını seçer.
+
+    Stdlib `ThreadingHTTPServer` yalnızca IPv4'tür; `::1` gibi IPv6 adresleri
+    için AF_INET6 kullanan bir alt sınıf gerekir.
+    """
+
+    hostname = _extract_hostname(host) or host
+    try:
+        if ipaddress.ip_address(hostname).version == 6:
+            return _ThreadingHTTPServerV6
+    except ValueError:
+        pass
+    return ThreadingHTTPServer
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         server = make_server(args.host, args.port)
-    except HostBindingError as exc:
+    except (HostBindingError, AdbError) as exc:
         print(f"Hata: {exc}")
         return 2
     url = f"http://{args.host}:{args.port}"
